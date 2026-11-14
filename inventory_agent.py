@@ -134,13 +134,17 @@ class InventoryDecisionAgent:
         # Quantity Discount indicators
         discount_keywords = [
             "discount", "price break", "price-break", "quantity break", "tier", "tiers",
-            "schedule", "all-units", "bulk price", "or more", "and above",
+            "schedule", "all-units", "bulk price", "or more", "and above", "at least",
+            "price breaks", "quantity breaks",
         ]
         for kw in discount_keywords:
             if kw in q_lower:
                 scores["quantity_discount"] += 4
-        if len(re.findall(r"\$\s*\d+(?:\.\d+)?", q_lower)) >= 3 and re.search(r"\d+\s*[-–to]+\s*\d+|\d+\+", q_lower):
-            scores["quantity_discount"] += 6
+        if len(re.findall(r"\$\s*\d+(?:\.\d+)?", q_lower)) >= 3 and (
+            re.search(r"\d+\s*(?:to|[-–—]|and)\s*\d+|\d+\+", q_lower)
+            or re.search(r"(?:below|under|at least|or more)\s*[\d,]+", q_lower)
+        ):
+            scores["quantity_discount"] += 8
 
         # Fixed-Period Review indicators
         periodic_keywords = [
@@ -243,28 +247,106 @@ class InventoryDecisionAgent:
           cost of placing an order, ordering/setup cost, cost to place an order, etc.
         """
         inputs: Dict[str, Any] = {}
-        num_pat = r"(\d[\d,]*(?:\.\d+)?(?:[kKmM])?)"
+        num_pat = r"((?:\d[\d,]*(?:\.\d+)?|\.\d+)(?:[kKmM])?)"
 
-        # 1. Annual demand (D)
-        m_demand = (
-            re.search(rf"(?:annual|yearly)\s+demand\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
-            or re.search(rf"demand\s+(?:of|is|=|:)?\s*{num_pat}\s*(?:units?)?\s*(?:per\s+year|annually|/year|a\s+year|each\s+year)", text, re.I)
-            or re.search(rf"{num_pat}\s*units?\s*(?:per\s+year|annually|/year|a\s+year|each\s+year)", text, re.I)
-            or re.search(rf"(?:sells|requires|needs|uses|usage\s+of)\s+{num_pat}\s*(?:units?)?\s*(?:per\s+year|annually|a\s+year|each\s+year)", text, re.I)
-            or re.search(rf"(?:annual|yearly)\s+(?:usage|sales|requirement)\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
-            or re.search(rf"\bD\s*=\s*{num_pat}", text)
-            or re.search(rf"demand\s+(?:of|is|=|:)\s*{num_pat}", text, re.I)
+        # 0. Working days (if specified in prompt)
+        m_days = (
+            re.search(rf"{num_pat}\s*(?:working|business|operating)\s*days(?:\s*(?:per|a)\s*year|\s*annually)?", text, re.I)
+            or re.search(rf"(?:open|operates?|operating)\s*(?:for\s*)?{num_pat}\s*days(?:\s*(?:per|a)\s*year|\s*annually)?", text, re.I)
         )
-        if m_demand:
-            inputs["annual_demand"] = self._parse_number(m_demand.group(1))
-        else:
-            # Check monthly or weekly demand and convert to annual
-            m_month = re.search(rf"(?:monthly\s+demand|demand\s+per\s+month)\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I) or re.search(rf"{num_pat}\s*units?\s*(?:per\s+month|a\s+month|monthly)", text, re.I)
-            m_week = re.search(rf"(?:weekly\s+demand|demand\s+per\s+week)\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I) or re.search(rf"{num_pat}\s*units?\s*(?:per\s+week|a\s+week|weekly)", text, re.I)
-            if m_month:
-                inputs["annual_demand"] = self._parse_number(m_month.group(1)) * 12.0
-            elif m_week:
-                inputs["annual_demand"] = self._parse_number(m_week.group(1)) * 52.0
+        working_days = self._parse_number(m_days.group(1)) if m_days else None
+        if working_days is not None:
+            inputs["working_days"] = working_days
+
+        # 1. Demand (D) extraction with time unit recognition & annualization
+        # Prioritize matching demand with explicit time period (month, week, day, year)
+        # to ensure proper annual basis conversion before calculation.
+        raw_demand_val: Optional[float] = None
+        demand_period: Optional[str] = None
+
+        # Check 1: Prefix period: "monthly demand is 1,000", "annual demand is 10,000", "daily demand of 50"
+        m_prefix = re.search(
+            rf"\b(annual|yearly|monthly|weekly|daily|quarterly)\s+(?:demand|usage|sales|requirement|volume|orders?)(?:\s+for\s+[^,\.;\n\d]+?)?\s*(?:averages?|is\s+on\s+average|of|is|=|:)?\s*{num_pat}",
+            text,
+            re.I,
+        )
+        if m_prefix:
+            demand_period = m_prefix.group(1).lower().strip()
+            raw_demand_val = self._parse_number(m_prefix.group(2))
+
+        # Check 2: Suffix period with demand keyword: "demand is 1,000 units per month", "sells 1,200 units per year"
+        if raw_demand_val is None:
+            m_suffix_kw = re.search(
+                rf"(?:demand|sales|usage|requirement|volume|requires?|sells?|needs?|uses?)\s*(?:for\s+[^,\.;\n\d]+?)?\s*(?:averages?|is\s+on\s+average|of|is|=|:)?\s*{num_pat}\s*(?:units?|items?|components?|pieces?|cases?|boxes?|widgets?|gallons?|pounds?|lbs?|tons?)?\s*(?:per|\/|a|each)\s*(year|annum|month|week|day|quarter)",
+                text,
+                re.I,
+            )
+            if m_suffix_kw:
+                raw_demand_val = self._parse_number(m_suffix_kw.group(1))
+                demand_period = m_suffix_kw.group(2).lower().strip()
+
+        # Check 3: Suffix period with units without demand keyword: "1,000 units per month", "1,200 units a year"
+        if raw_demand_val is None:
+            m_suffix_unit = re.search(
+                rf"{num_pat}\s*(?:units?|items?|components?|pieces?|cases?|boxes?|widgets?|gallons?|pounds?|lbs?|tons?)\s*(?:per|\/|a|each)\s*(year|annum|month|week|day|quarter)",
+                text,
+                re.I,
+            )
+            if m_suffix_unit:
+                raw_demand_val = self._parse_number(m_suffix_unit.group(1))
+                demand_period = m_suffix_unit.group(2).lower().strip()
+
+        # Check 4: Adverbs: "1,000 units monthly", "sells 10,000 units annually"
+        if raw_demand_val is None:
+            m_adverb = re.search(
+                rf"(?:demand|sales|usage|requirement|volume|requires?|sells?|needs?|uses?)?\s*(?:for\s+[^,\.;\n\d]+?)?\s*(?:averages?|is\s+on\s+average|of|is|=|:)?\s*{num_pat}\s*(?:units?|items?|components?|pieces?)?\s*(annually|monthly|weekly|daily|quarterly)",
+                text,
+                re.I,
+            )
+            if m_adverb and m_adverb.group(2):
+                raw_demand_val = self._parse_number(m_adverb.group(1))
+                demand_period = m_adverb.group(2).lower().strip()
+
+        # Check 5: Standalone D = number
+        if raw_demand_val is None:
+            m_d = re.search(rf"\bD\s*=\s*{num_pat}", text)
+            if m_d:
+                raw_demand_val = self._parse_number(m_d.group(1))
+                demand_period = "year"
+
+        # Check 6: Generic demand without specified period: "demand is 10,000", "demand of 5,000"
+        if raw_demand_val is None:
+            m_gen = re.search(rf"(?:demand|usage|sales|requirement)\s+(?:of|is|=|:)\s*{num_pat}", text, re.I)
+            if m_gen:
+                raw_demand_val = self._parse_number(m_gen.group(1))
+                demand_period = "year"
+
+        # Normalization to annual demand:
+        if raw_demand_val is not None:
+            p_clean = (demand_period or "year").lower().strip()
+            if p_clean in ("year", "yearly", "annual", "annually", "annum"):
+                conversion_factor = 1.0
+                norm_period = "year"
+            elif p_clean in ("month", "monthly"):
+                conversion_factor = 12.0
+                norm_period = "month"
+            elif p_clean in ("week", "weekly"):
+                conversion_factor = 52.0
+                norm_period = "week"
+            elif p_clean in ("quarter", "quarterly"):
+                conversion_factor = 4.0
+                norm_period = "quarter"
+            elif p_clean in ("day", "daily"):
+                conversion_factor = working_days if working_days else 365.0
+                norm_period = "day"
+            else:
+                conversion_factor = 1.0
+                norm_period = "year"
+
+            inputs["annual_demand"] = raw_demand_val * conversion_factor
+            inputs["stated_demand"] = raw_demand_val
+            inputs["demand_period"] = norm_period
+            inputs["demand_conversion_factor"] = conversion_factor
 
         # 2. Ordering cost (S) - MUST support all required synonyms and natural expressions:
         # - Subject is order: "Each order costs $50 to place", "An order costs $50 to place", "Every order costs $50", "Orders cost $50 to place"
@@ -383,13 +465,33 @@ class InventoryDecisionAgent:
             inputs["holding_rate"] = base["holding_rate"]
         if "holding_cost" in base:
             inputs["holding_cost"] = base["holding_cost"]
+        if "stated_demand" in base:
+            inputs["stated_demand"] = base["stated_demand"]
+        if "demand_period" in base:
+            inputs["demand_period"] = base["demand_period"]
+        if "demand_conversion_factor" in base:
+            inputs["demand_conversion_factor"] = base["demand_conversion_factor"]
 
         tiers: List[Dict[str, Any]] = []
         num_pat = r"\d[\d,]*(?:\.\d+)?"
 
-        # Pattern 1: Standard range tiers: "1 to 999 units at $5.00" / "1-499: $10.00" / "1 - 999 @ $5.00"
+        # Pattern 1a: Below/under range first: "orders below 500 units at $12", "under 500 units: $12"
+        below_matches = re.finditer(
+            rf"(?:orders\s+(?:of\s+)?)?(?:below|under|less\s+than|up\s+to)\s*({num_pat})\s*(?:units?)?\s*(?:[:=@]|is|at|for|costs?|unit\s+price\s+is)?\s*\$\s*({num_pat})",
+            text,
+            re.I,
+        )
+        for m in below_matches:
+            cutoff = self._parse_number(m.group(1))
+            tiers.append({
+                "min_qty": 1.0,
+                "max_qty": (cutoff - 1.0) if cutoff > 1.0 else cutoff,
+                "unit_cost": self._parse_number(m.group(2)),
+            })
+
+        # Pattern 1b: Standard range tiers: "1 to 999 units at $5.00" / "500-999 units at $11.50"
         range_matches = re.finditer(
-            rf"({num_pat})\s*(?:to|[-–—])\s*({num_pat})\s*(?:units?)?\s*(?:[:=@]|is|at|for|costs?|unit\s+price\s+is)?\s*\$\s*({num_pat})",
+            rf"(?:orders\s+(?:of\s+)?)?(?:between\s+)?({num_pat})\s*(?:to|[-–—]|and)\s*({num_pat})\s*(?:units?)?\s*(?:[:=@]|is|at|for|costs?|unit\s+price\s+is)?\s*\$\s*({num_pat})",
             text,
             re.I,
         )
@@ -402,7 +504,7 @@ class InventoryDecisionAgent:
 
         # Pattern 2: Open-ended top tier: "2,000+ units at $4.75" / "2,000 or more: $4.75" / "at least 2,000 units: $4.75"
         plus_matches = re.finditer(
-            rf"(?:({num_pat})\s*(?:\+|\s+or\s+more|\s+and\s+above|\s+and\s+over)|(?:over|above|at\s+least)\s+({num_pat}))\s*(?:units?)?\s*(?:[:=@]|is|at|for|costs?|unit\s+price\s+is)?\s*\$\s*({num_pat})",
+            rf"(?:(?:orders\s+(?:of\s+)?)?({num_pat})\s*(?:units?)?\s*(?:\+|\s+or\s+more|\s+and\s+above|\s+and\s+over)|(?:orders\s+(?:of\s+)?)?(?:over|above|at\s+least)\s+({num_pat}))\s*(?:units?)?\s*(?:[:=@]|is|at|for|costs?|unit\s+price\s+is)?\s*\$\s*({num_pat})",
             text,
             re.I,
         )
@@ -414,10 +516,23 @@ class InventoryDecisionAgent:
                 "unit_cost": self._parse_number(m.group(3)),
             })
 
-        # Pattern 3: Reverse phrasing: "$5.00 for 1-999 units", "$4.80 for 1,000-1,999 units", "$4.75 for 2,000+ units"
+        # Pattern 3: Reverse phrasing: price first, then quantity
+        # e.g. "$12 per unit for orders below 500 units, $11.50 for 500-999 units, and $11 for orders of 1,000 units or more"
         if not tiers:
+            rev_below = re.finditer(
+                rf"\$\s*({num_pat})\s*(?:per\s+unit\s*)?(?:for\s+(?:orders\s+(?:of\s+)?)?|if\s+ordering|on|for\s+)?(?:orders\s+(?:of\s+)?)?(?:below|under|less\s+than|up\s+to)\s*({num_pat})\s*(?:units?)?",
+                text,
+                re.I,
+            )
+            for m in rev_below:
+                cutoff = self._parse_number(m.group(2))
+                tiers.append({
+                    "min_qty": 1.0,
+                    "max_qty": (cutoff - 1.0) if cutoff > 1.0 else cutoff,
+                    "unit_cost": self._parse_number(m.group(1)),
+                })
             rev_range = re.finditer(
-                rf"\$\s*({num_pat})\s*(?:per\s+unit\s*)?(?:for|if\s+ordering|on)?\s*({num_pat})\s*(?:to|[-–—])\s*({num_pat})",
+                rf"\$\s*({num_pat})\s*(?:per\s+unit\s*)?(?:for\s+(?:orders\s+(?:of\s+)?)?|if\s+ordering|on|for\s+)?(?:orders\s+(?:of\s+)?)?(?:between\s+)?({num_pat})\s*(?:to|[-–—]|and)\s*({num_pat})\s*(?:units?)?",
                 text,
                 re.I,
             )
@@ -428,7 +543,7 @@ class InventoryDecisionAgent:
                     "unit_cost": self._parse_number(m.group(1)),
                 })
             rev_plus = re.finditer(
-                rf"\$\s*({num_pat})\s*(?:per\s+unit\s*)?(?:for|if\s+ordering|on)?\s*({num_pat})\s*(?:\+|\s+or\s+more|\s+and\s+above)",
+                rf"\$\s*({num_pat})\s*(?:per\s+unit\s*)?(?:for\s+(?:orders\s+(?:of\s+)?)?|if\s+ordering|on|for\s+)?(?:orders\s+(?:of\s+)?)?(?:at\s+least|over|above)?\s*({num_pat})\s*(?:units?)?\s*(?:\+|\s+or\s+more|\s+and\s+above|\s+and\s+over)",
                 text,
                 re.I,
             )
@@ -477,29 +592,138 @@ class InventoryDecisionAgent:
         """
         Extract Safety Stock and Reorder Point inputs.
         Distinguishes:
-        - average demand
+        - average demand (and time unit: daily, weekly, etc.)
         - demand standard deviation
-        - average lead time
-        - lead-time standard deviation
+        - average lead time (and time unit: days vs. weeks)
+        - lead-time standard deviation (and time unit)
         - service level
+        - operating days per week (defaulting to 7 days, with 5 business days documented)
         """
         inputs: Dict[str, Any] = {}
         num_pat = r"(\d[\d,]*(?:\.\d+)?)"
 
-        # 1. Lead-time standard deviation (sigma_L) - Extract before demand std dev to avoid cross-matching
-        m_std_lt = (
-            re.search(rf"(?:lead\s*[- ]?time\s+(?:standard\s+deviation|std\.?\s*dev\.?|sigma)|(?:standard\s+deviation|std\.?\s*dev\.?|sigma)\s+(?:of|in)\s+lead\s*[- ]?time)\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
-            or re.search(rf"lead\s*[- ]?time\s+(?:averages?\s+[\d,]+(?:\.\d+)?\s*(?:days?|weeks?)?\s+)?with\s+(?:a\s+)?(?:standard\s+deviation|std\.?\s*dev\.?)\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
-            or re.search(rf"{num_pat}\s*(?:days?|weeks?)\s*(?:standard\s+deviation|std\.?\s*dev\.?)\s+(?:of|in|for)\s+lead\s*[- ]?time", text, re.I)
-            or re.search(rf"\bsigma_?[lL]\s*=\s*{num_pat}", text)
+        # Operating days per week assumption (default 7 days/week, detect if 5 business/work days specified)
+        m_op_days = re.search(
+            r"(\d+)\s*(?:operating\s+days|business\s+days|working\s+days|days)\s*(?:per|a)\s*week",
+            text,
+            re.I,
+        ) or re.search(r"(\d+)[- ]day\s*(?:work\s*week|business\s*week|working\s*week)", text, re.I)
+        days_per_week = self._parse_number(m_op_days.group(1)) if m_op_days else 7.0
+
+        # Demand time unit detection
+        demand_unit = "day"  # Default assumption for inventory ROP unless specified
+        if re.search(r"(?:per\s+day|daily|a\s+day|day['s]?\s+demand|units?\s*/\s*day)", text, re.I):
+            demand_unit = "day"
+        elif re.search(r"(?:per\s+week|weekly|a\s+week|week['s]?\s+demand|units?\s*/\s*week)", text, re.I):
+            demand_unit = "week"
+        elif re.search(r"(?:per\s+month|monthly|a\s+month|month['s]?\s+demand|units?\s*/\s*month)", text, re.I):
+            demand_unit = "month"
+        elif re.search(r"(?:per\s+year|annually|annual|yearly|a\s+year|year['s]?\s+demand|units?\s*/\s*year)", text, re.I):
+            demand_unit = "year"
+
+        # 1. Lead time (L) and Lead-time standard deviation (sigma_L)
+        stated_lead_time = None
+        lead_time_unit = None
+        stated_std_lead_time = None
+        std_lead_time_unit = None
+
+        # Pattern A: Combined sentence: e.g. "Average lead time is 3 weeks with a standard deviation of 0.5 weeks"
+        # or "Lead time averages 3 weeks with std dev 0.5 weeks", "Average lead time is 3 weeks and standard deviation of 0.5 weeks"
+        m_lt_combined = re.search(
+            rf"(?:average|mean|replenishment)?\s*lead\s*[- ]?time\s+(?:is|of|=|:|averages?)\s*{num_pat}\s*(days?|weeks?|months?)?\s*(?:,|with|and)?\s*(?:a\s+)?(?:standard\s+deviation|std\.?\s*dev\.?|sigma)\s+(?:of|is|=|:)?\s*{num_pat}\s*(days?|weeks?|months?)?",
+            text,
+            re.I,
         )
-        if m_std_lt:
-            inputs["std_lead_time"] = self._parse_number(m_std_lt.group(1))
+        if m_lt_combined:
+            stated_lead_time = self._parse_number(m_lt_combined.group(1))
+            lead_time_unit = m_lt_combined.group(2).lower() if m_lt_combined.group(2) else None
+            stated_std_lead_time = self._parse_number(m_lt_combined.group(3))
+            std_lead_time_unit = m_lt_combined.group(4).lower() if m_lt_combined.group(4) else lead_time_unit
+
+        # Pattern B: Standalone lead-time standard deviation (if not captured above)
+        if stated_std_lead_time is None:
+            m_std_lt = (
+                re.search(
+                    rf"(?:lead\s*[- ]?time\s+(?:standard\s+deviation|std\.?\s*dev\.?|sigma)|(?:standard\s+deviation|std\.?\s*dev\.?|sigma)\s+(?:of|in)\s+lead\s*[- ]?time)\s+(?:of|is|=|:)?\s*{num_pat}\s*(days?|weeks?|months?)?",
+                    text,
+                    re.I,
+                )
+                or re.search(
+                    rf"lead\s*[- ]?time\s+(?:(?:is|of|=|:|averages?)\s+[\d,]+(?:\.\d+)?\s*(?:days?|weeks?|months?)?\s+)?(?:with|and)\s+(?:a\s+)?(?:standard\s+deviation|std\.?\s*dev\.?|sigma)\s+(?:of|is|=|:)?\s*{num_pat}\s*(days?|weeks?|months?)?",
+                    text,
+                    re.I,
+                )
+                or re.search(
+                    rf"{num_pat}\s*(days?|weeks?|months?)\s*(?:standard\s+deviation|std\.?\s*dev\.?)\s+(?:of|in|for)\s+lead\s*[- ]?time",
+                    text,
+                    re.I,
+                )
+                or re.search(rf"\bsigma_?[lL]\s*=\s*{num_pat}\s*(days?|weeks?|months?)?", text)
+            )
+            if m_std_lt:
+                stated_std_lead_time = self._parse_number(m_std_lt.group(1))
+                if len(m_std_lt.groups()) > 1 and m_std_lt.group(2):
+                    std_lead_time_unit = m_std_lt.group(2).lower()
+
+        # Pattern C: Standalone average lead time (if not captured above)
+        if stated_lead_time is None:
+            m_lt = (
+                re.search(
+                    rf"(?:average|mean|replenishment|supplier)?\s*lead\s*[- ]?time\s+(?:of|is|=|:|averages?)\s*{num_pat}\s*(days?|weeks?|months?)?",
+                    text,
+                    re.I,
+                )
+                or re.search(
+                    rf"{num_pat}\s*(days?|weeks?|months?)\s*(?:replenishment\s+)?lead\s*[- ]?time",
+                    text,
+                    re.I,
+                )
+                or re.search(
+                    rf"(?:takes|requires|arrives\s+in)\s*{num_pat}\s*(days?|weeks?|months?)\s*(?:to\s+arrive|lead\s*[- ]?time)?",
+                    text,
+                    re.I,
+                )
+                or re.search(rf"\bL\s*=\s*{num_pat}\s*(days?|weeks?|months?)?", text)
+            )
+            if m_lt:
+                stated_lead_time = self._parse_number(m_lt.group(1))
+                if len(m_lt.groups()) > 1 and m_lt.group(2):
+                    lead_time_unit = m_lt.group(2).lower()
+
+        if lead_time_unit and not std_lead_time_unit:
+            std_lead_time_unit = lead_time_unit
+
+        # Unit normalization: convert lead time and lead time std dev to days if demand is daily and lead time is in weeks
+        normalized_lead_time = stated_lead_time
+        normalized_std_lead_time = stated_std_lead_time
+        if stated_lead_time is not None:
+            if demand_unit == "day" and lead_time_unit in ("week", "weeks"):
+                normalized_lead_time = stated_lead_time * days_per_week
+                if stated_std_lead_time is not None:
+                    normalized_std_lead_time = stated_std_lead_time * days_per_week
+
+            inputs["lead_time"] = normalized_lead_time
+            inputs["stated_lead_time"] = stated_lead_time
+            if lead_time_unit:
+                inputs["lead_time_unit"] = lead_time_unit
+
+        if normalized_std_lead_time is not None:
+            inputs["std_lead_time"] = normalized_std_lead_time
+            inputs["stated_std_lead_time"] = stated_std_lead_time
+            if std_lead_time_unit:
+                inputs["std_lead_time_unit"] = std_lead_time_unit
+        elif stated_std_lead_time is None and (
+            re.search(r"constant\s+lead\s*[- ]?time|lead\s*[- ]?time\s+is\s+constant", text, re.I)
+        ):
+            inputs["std_lead_time"] = 0.0
+
+        inputs["demand_unit"] = demand_unit
+        inputs["days_per_week"] = days_per_week
 
         # 2. Demand standard deviation (sigma_d)
         m_std_d = (
             re.search(rf"(?:demand\s+(?:standard\s+deviation|std\.?\s*dev\.?|sigma)|(?:standard\s+deviation|std\.?\s*dev\.?|sigma)\s+(?:of|in)\s+demand)\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
-            or re.search(rf"demand\s+(?:averages?\s+[\d,]+(?:\.\d+)?\s*(?:units?)?\s+)?with\s+(?:a\s+)?(?:standard\s+deviation|std\.?\s*dev\.?)\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
+            or re.search(rf"demand(?:\s+(?:for|of)\s+[^,\.;\n]+?)?\s+(?:averages?\s+[\d,]+(?:\.\d+)?\s*(?:units?)?\s+)?with\s+(?:a\s+)?(?:standard\s+deviation|std\.?\s*dev\.?)\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
             or re.search(rf"{num_pat}\s*units?\s*(?:standard\s+deviation|std\.?\s*dev\.?)\s+(?:of|in|for)\s+demand", text, re.I)
             or re.search(rf"(?:standard\s+deviation|std\.?\s*dev\.?)\s+(?:of|is|=|:)?\s*{num_pat}\s*units?", text, re.I)
             or re.search(rf"\bsigma_?[dD]\s*=\s*{num_pat}", text)
@@ -509,34 +733,59 @@ class InventoryDecisionAgent:
         elif re.search(r"constant\s+demand|demand\s+is\s+constant", text, re.I):
             inputs["std_demand"] = 0.0
 
+        # If lead time variability was not mentioned, but demand variability was, default std_lead_time to 0.0
+        if "std_lead_time" not in inputs and "std_demand" in inputs:
+            inputs["std_lead_time"] = 0.0
+
         # 3. Average demand (d_bar)
+        # Supports business language variations:
+        # - "daily demand averages 150 units", "daily demand for a warehouse item averages 150 units"
+        # - "average daily demand is 150 units", "mean demand of 150 units", "average demand is 150 units"
+        # - "daily demand of 150 units", "weekly demand is 150 units"
+        # - "demand of 150 units per day", "demand averages 150 units per day"
+        # - "constant demand of 150 units", "d = 150"
         m_avg = (
-            re.search(rf"(?:average|mean)\s+(?:daily|weekly|period)?\s*demand\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
-            or re.search(rf"demand\s+averages?\s*{num_pat}", text, re.I)
-            or re.search(rf"(?:daily|weekly)\s+demand\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
-            or re.search(rf"demand\s+(?:of|is|=|:)\s*{num_pat}\s*units?\s*per\s*(?:day|week|period)", text, re.I)
-            or re.search(rf"constant\s+demand\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
-            or re.search(rf"\b[dD]\s*=\s*{num_pat}", text)
+            # 1. Subject-first with 'averages': e.g. "daily demand for a warehouse item averages 150 units", "daily demand averages 150 units", "demand averages 150 units"
+            re.search(
+                rf"(?:daily|weekly|monthly|period|annual|yearly)?\s*demand(?:\s+for\s+[^,\.;\n\d]+?)?\s+(?:averages?|is\s+on\s+average)\s+(?:of|is|=|:|at)?\s*{num_pat}",
+                text,
+                re.I,
+            )
+            # 2. Adjective-first: e.g. "average daily demand is 150 units", "average demand of 150 units", "mean daily demand is 150"
+            or re.search(
+                rf"(?:average|mean|expected)\s+(?:daily|weekly|monthly|period|annual|yearly)?\s*demand(?:\s+for\s+[^,\.;\n\d]+?)?\s+(?:of|is|=|:|at|\$)?\s*{num_pat}(?!\s*%)",
+                text,
+                re.I,
+            )
+            # 3. Direct period demand: e.g. "daily demand is 150 units", "daily demand of 150 units", "weekly demand: 150"
+            or re.search(
+                rf"(?:daily|weekly|monthly|period)\s+demand(?:\s+for\s+[^,\.;\n\d]+?)?\s+(?:of|is|=|:|at)?\s*{num_pat}(?!\s*%)",
+                text,
+                re.I,
+            )
+            # 4. Rate-based phrasings: e.g. "demand of 150 units per day", "demand is 150 units/day", "demand averages 150 units a day"
+            or re.search(
+                rf"demand(?:\s+for\s+[^,\.;\n\d]+?)?\s+(?:of|is|=|:|at|averages?)\s*{num_pat}\s*units?\s*(?:per\s+(?:day|week|month|period)|a\s+(?:day|week|month)|daily|weekly)",
+                text,
+                re.I,
+            )
+            # 5. Constant demand phrasings: e.g. "constant demand of 150", "steady demand of 150"
+            or re.search(
+                rf"(?:constant|steady)\s+demand(?:\s+for\s+[^,\.;\n\d]+?)?\s+(?:of|is|=|:)?\s*{num_pat}",
+                text,
+                re.I,
+            )
+            # 6. Standalone verb: e.g. "averages 150 units per day", "averages 150 units daily"
+            or re.search(
+                rf"averages?\s+{num_pat}\s*units?\s*(?:per\s+(?:day|week|month|period)|a\s+(?:day|week|month)|daily|weekly)",
+                text,
+                re.I,
+            )
+            # 7. Variable notation: d = 150, d_bar = 150, D = 150
+            or re.search(rf"\b(?:d_?bar|[dD])\s*=\s*{num_pat}", text)
         )
         if m_avg:
             inputs["avg_demand"] = self._parse_number(m_avg.group(1))
-
-        # 4. Average lead time (L)
-        m_lt = (
-            re.search(rf"(?:average|mean|replenishment|supplier)?\s*lead\s*[- ]?time\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
-            or re.search(rf"lead\s*[- ]?time\s+averages?\s*{num_pat}", text, re.I)
-            or re.search(rf"{num_pat}\s*(?:days?|weeks?|months?)\s*(?:replenishment\s+)?lead\s*[- ]?time", text, re.I)
-            or re.search(rf"(?:takes|requires|arrives\s+in)\s*{num_pat}\s*(?:days?|weeks?)\s*(?:to\s+arrive|lead\s*[- ]?time)?", text, re.I)
-            or re.search(rf"\bL\s*=\s*{num_pat}", text)
-        )
-        if m_lt:
-            inputs["lead_time"] = self._parse_number(m_lt.group(1))
-
-        # Default std_lead_time to 0.0 if not specified but lead time is constant or demand std dev is present
-        if "std_lead_time" not in inputs and (
-            "std_demand" in inputs or re.search(r"constant\s+lead\s*[- ]?time|lead\s*[- ]?time\s+is\s+constant", text, re.I)
-        ):
-            inputs["std_lead_time"] = 0.0
 
         # 5. Service level (%) or explicit z-score
         m_sl = (
@@ -593,14 +842,18 @@ class InventoryDecisionAgent:
 
         # 1. Review period (T or P)
         m_rev = (
-            re.search(rf"review\s+(?:period|interval|cycle)\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
-            or re.search(rf"reviews?\s+(?:inventory\s+)?every\s+{num_pat}\s*(?:days?|weeks?|months?|periods?)", text, re.I)
-            or re.search(rf"{num_pat}\s*[- ]?(?:day|week|month)\s+review\s+period", text, re.I)
-            or re.search(rf"order\s+(?:interval|cycle)\s+(?:of|is|=|:)?\s*{num_pat}", text, re.I)
-            or re.search(rf"\b[TP]\s*=\s*{num_pat}", text)
+            re.search(rf"review\s+(?:period|interval|cycle)\s+(?:of|is|=|:)?\s*{num_pat}\s*(days?|weeks?|months?|periods?)?", text, re.I)
+            or re.search(rf"reviews?\s+(?:inventory\s+)?every\s+{num_pat}\s*(days?|weeks?|months?|periods?)", text, re.I)
+            or re.search(rf"{num_pat}\s*[- ]?(day|week|month)\s+review\s+period", text, re.I)
+            or re.search(rf"order\s+(?:interval|cycle)\s+(?:of|is|=|:)?\s*{num_pat}\s*(days?|weeks?|months?|periods?)?", text, re.I)
+            or re.search(rf"\b[TP]\s*=\s*{num_pat}\s*(days?|weeks?|months?|periods?)?", text)
         )
         if m_rev:
-            inputs["review_period"] = self._parse_number(m_rev.group(1))
+            rp_val = self._parse_number(m_rev.group(1))
+            rp_unit = m_rev.group(2).lower() if len(m_rev.groups()) > 1 and m_rev.group(2) else None
+            if rp_unit in ("week", "weeks") and base.get("demand_unit") == "day":
+                rp_val = rp_val * base.get("days_per_week", 7.0)
+            inputs["review_period"] = rp_val
 
         # 2. Inventory Position components: on-hand, on-order, backorders
         # On-hand inventory
@@ -929,18 +1182,28 @@ class InventoryDecisionAgent:
         inter_lines = []
         if "tier_evaluations" in inter:
             for t in inter["tier_evaluations"]:
-                max_str = f"{t['max_qty']:,.0f}" if t["max_qty"] is not None else "∞"
+                max_str = f"{t['max_qty']:,.0f}" if t["max_qty"] is not None else "and above"
                 marker = " **[Selected Optimal]**" if t.get("tier_index") == results.get("optimal_tier") else ""
+                range_label = f"{t['min_qty']:,.0f} - {max_str} units" if t["max_qty"] is not None else f"{t['min_qty']:,.0f}+ units"
                 inter_lines.append(
-                    f"- **Tier {t['tier_index']} ({t['min_qty']:,.0f} – {max_str} units @ ${t['unit_cost']:,.2f}/unit)**: "
+                    f"- **Tier {t['tier_index']} ({range_label} @ ${t['unit_cost']:,.2f}/unit)**: "
                     f"Unconstrained Q* = {t['unconstrained_eoq']:,.2f}, Evaluated Q = {t['evaluated_order_qty']:,.2f} | "
                     f"Ordering = ${t['annual_ordering_cost']:,.2f}, Holding = ${t['annual_holding_cost']:,.2f}, "
-                    f"Purchase = ${t['annual_purchase_cost']:,.2f} → **Total = ${t['total_annual_cost']:,.2f}**{marker}"
+                    f"Purchase = ${t['annual_purchase_cost']:,.2f} -> **Total = ${t['total_annual_cost']:,.2f}**{marker}"
                 )
         else:
             for k, v in inter.items():
                 if v is not None:
-                    if isinstance(v, float):
+                    if k == "alternative_5day_work_week" and isinstance(v, dict):
+                        inter_lines.append(
+                            f"- **Alternative 5-Day Work Week**: L = {v.get('lead_time_days', 0):g} days, "
+                            f"sigma_L = {v.get('std_lead_time_days', 0):g} days -> "
+                            f"Expected LTD = {v.get('expected_demand_during_lead_time', 0):,.2f} units, "
+                            f"sigma_LT = {v.get('sigma_lt', 0):,.2f} units, "
+                            f"Safety Stock = {v.get('safety_stock', 0):,.2f} units (approx. {v.get('safety_stock_rounded', 0):,} units), "
+                            f"ROP = {v.get('reorder_point', 0):,.2f} units (approx. {v.get('reorder_point_rounded', 0):,} units)"
+                        )
+                    elif isinstance(v, float):
                         inter_lines.append(f"- **{k.replace('_', ' ').title()}**: {v:,.4g}")
                     else:
                         inter_lines.append(f"- **{k.replace('_', ' ').title()}**: {v}")

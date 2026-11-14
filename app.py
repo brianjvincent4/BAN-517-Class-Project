@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 from typing import Any, Dict, List, Optional
 
 import altair as alt
@@ -21,6 +22,16 @@ import pandas as pd
 from scipy.stats import norm
 
 from inventory_agent import MODEL_METADATA, InventoryDecisionAgent
+from inventory_classification import (
+    CLASSIFICATION_REQUIRED_COLUMNS,
+    SCORE_MAP,
+    WEIGHT_HITS,
+    WEIGHT_SALES,
+    assign_final_class_from_score,
+    assign_pareto_class,
+    classify_inventory_multicriteria,
+    validate_classification_dataframe,
+)
 from inventory_tools import (
     calculate_eoq,
     calculate_newsvendor,
@@ -839,6 +850,333 @@ def render_sensitivity_tab(response: Any) -> None:
 
 
 # =====================================================================
+# Multicriteria Inventory Classification UI Section (BAN 517)
+# =====================================================================
+def render_multicriteria_classification_section(clean_df: pd.DataFrame) -> None:
+    """
+    Render the comprehensive multicriteria inventory classification dashboard (BAN 517).
+    Includes:
+    - Boundary convention selector (strict, straddle, rounded)
+    - Theoretical framework callout (Pareto thresholds, scoring, weighted formula)
+    - KPI metric summary cards
+    - Required Classification Summary Table (Final Class, Number of Items, % of Items, Total Sales $, % of Total Sales)
+    - 4 Altair analytical charts:
+        1. Number of Items by Final Class
+        2. Total Sales ($) by Final Class
+        3. Multicriteria Cross-Tabulation Matrix Heatmap (Sales Class vs Hits Class)
+        4. Cumulative Sales (%) Pareto Curve with threshold reference lines
+    - Full 15-column interactive data table with filters (Class, Search) and CSV download
+    """
+    import streamlit as st
+
+    st.markdown("## 🏷️ Multicriteria Inventory Classification")
+    st.markdown(
+        "<div style='font-size: 0.95rem; color: #4B5563; margin-bottom: 1.25rem;'>"
+        "Implementation of the BAN 517 multicriteria inventory classification methodology based on independent "
+        "Pareto analysis of <b>Annual Sales ($)</b> and <b>Point-of-Sale (POS) Hits</b>, weighted categorical scoring, "
+        "and matrix-based final classification."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Finalized Methodology & Continuous Ranges Callout
+    with st.expander("📖 View Finalized Classification Methodology & Scoring Rules", expanded=True):
+        f_col1, f_col2 = st.columns([1.2, 1.8])
+        with f_col1:
+            st.markdown(
+                "**Continuous Pareto Cumulative Ranges**:\n"
+                "- **Class A**: 0% through 60%, inclusive ($\\le 60\\%$)\n"
+                "- **Class B**: Greater than 60% through 80%, inclusive ($>60\\% \\text{ to } \\le 80\\%$)\n"
+                "- **Class C**: Greater than 80% through 90%, inclusive ($>80\\% \\text{ to } \\le 90\\%$)\n"
+                "- **Class D**: Greater than 90% through 100%, inclusive ($>90\\% \\text{ to } \\le 100\\%$)\n\n"
+                "*Classifications are assigned based on the cumulative percentage after including each ranked item.*"
+            )
+        with f_col2:
+            st.markdown(
+                "**Scoring & Multicriteria Classification**:\n"
+                "- **Numerical Scores**: $A = 4,\\, B = 3,\\, C = 2,\\, D = 1$\n"
+                "- **Combined Weighted Score**: $0.65 \\times \\text{Sales Score} + 0.35 \\times \\text{Hits Score}$\n"
+                "- **Final Thresholds**: **A** [3.25 – 4.00], **B** [2.50 – 3.24], **C** [1.75 – 2.49], **D** [< 1.75]\n"
+                "- *Professor Example*: Sales A (4) & Hits B (3) $\\rightarrow 0.65(4) + 0.35(3) = 3.65 \\rightarrow \\text{Final Class A}$"
+            )
+
+    # Perform deterministic multicriteria classification using finalized continuous ranges
+    results = classify_inventory_multicriteria(clean_df)
+    classified_df = results["classified_df"]
+    summary_df = results["summary_df"]
+    reconciliation = results["reconciliation"]
+    score_matrix = results["score_matrix"]
+
+    # 1. Dataset Summary KPI Metrics
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Items", f"{results['total_items']:,}")
+    m2.metric("Total Annual Sales", f"${results['total_sales']:,.2f}")
+    m3.metric("Total POS Hits", f"{results['total_hits']:,}")
+    m4.metric(
+        "Data Reconciliation",
+        "✅ 100% Balanced" if reconciliation["is_reconciled"] else "⚠️ Unbalanced",
+        f"{reconciliation['reconciled_items']} items accounted for",
+    )
+
+    st.markdown("---")
+
+    # 2. Required Classification Summary Table
+    st.markdown("### 📋 Required Classification Summary Table")
+    st.caption("Aggregated distribution of inventory items and annual sales volume across Final Inventory Classes.")
+
+    st.dataframe(
+        summary_df,
+        column_config={
+            "Final Class": st.column_config.TextColumn("Final Class"),
+            "Number of Items": st.column_config.NumberColumn("Number of Items", format="%d"),
+            "Percentage of Items (%)": st.column_config.NumberColumn("Percentage of Items (%)", format="%.2f%%"),
+            "Total Sales ($)": st.column_config.NumberColumn("Total Sales ($)", format="$%,.2f"),
+            "Percentage of Total Sales (%)": st.column_config.NumberColumn("Percentage of Total Sales (%)", format="%.2f%%"),
+        },
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Summary table reconciliation verification badges
+    v_col1, v_col2 = st.columns(2)
+    with v_col1:
+        st.caption(
+            f"✓ **Items Total**: **{summary_df['Number of Items'].sum():,} items** "
+            f"({summary_df['Percentage of Items (%)'].sum():.2f}%)"
+        )
+    with v_col2:
+        st.caption(
+            f"✓ **Sales Total**: **${summary_df['Total Sales ($)'].sum():,.2f}** "
+            f"({summary_df['Percentage of Total Sales (%)'].sum():.2f}%)"
+        )
+
+    st.markdown("---")
+
+    # 3. Four Visualizations
+    st.markdown("### 📊 Multicriteria Visual Analytics")
+
+    v_tab1, v_tab2, v_tab3 = st.tabs([
+        "📊 Category Distribution (Items & Sales)",
+        "🔲 Multicriteria Cross-Tabulation Matrix",
+        "📈 Cumulative Sales Pareto Curve",
+    ])
+
+    class_color_scale = alt.Scale(
+        domain=["A", "B", "C", "D"],
+        range=["#1E3A8A", "#0D9488", "#D97706", "#6B7280"],
+    )
+
+    with v_tab1:
+        c1_col, c2_col = st.columns(2)
+        with c1_col:
+            st.markdown("##### 📦 Number of Items by Final Class")
+            chart_items = (
+                alt.Chart(summary_df)
+                .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
+                .encode(
+                    x=alt.X("Final Class:N", sort=["A", "B", "C", "D"], title="Final Inventory Class"),
+                    y=alt.Y("Number of Items:Q", title="Item Count (SKUs)"),
+                    color=alt.Color("Final Class:N", scale=class_color_scale, legend=None),
+                    tooltip=[
+                        alt.Tooltip("Final Class:N", title="Class"),
+                        alt.Tooltip("Number of Items:Q", title="Items", format=","),
+                        alt.Tooltip("Percentage of Items (%):Q", title="Share (%)", format=".2f"),
+                    ],
+                )
+                .properties(height=320)
+            )
+            text_items = chart_items.mark_text(dy=-10, fontWeight="bold", fontSize=12).encode(
+                text=alt.Text("Number of Items:Q", format=",")
+            )
+            st.altair_chart(chart_items + text_items, use_container_width=True)
+
+        with c2_col:
+            st.markdown("##### 💰 Total Sales ($) by Final Class")
+            chart_sales = (
+                alt.Chart(summary_df)
+                .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
+                .encode(
+                    x=alt.X("Final Class:N", sort=["A", "B", "C", "D"], title="Final Inventory Class"),
+                    y=alt.Y("Total Sales ($):Q", title="Total Sales ($)"),
+                    color=alt.Color("Final Class:N", scale=class_color_scale, legend=None),
+                    tooltip=[
+                        alt.Tooltip("Final Class:N", title="Class"),
+                        alt.Tooltip("Total Sales ($):Q", title="Total Sales", format="$,.2f"),
+                        alt.Tooltip("Percentage of Total Sales (%):Q", title="Sales Share (%)", format=".2f"),
+                    ],
+                )
+                .properties(height=320)
+            )
+            text_sales = chart_sales.mark_text(dy=-10, fontWeight="bold", fontSize=11).encode(
+                text=alt.Text("Total Sales ($):Q", format="$,.0f")
+            )
+            st.altair_chart(chart_sales + text_sales, use_container_width=True)
+
+    with v_tab2:
+        st.markdown("##### 🔲 Multicriteria Co-Occurrence Matrix (Sales Class vs POS Hits Class)")
+        st.caption(
+            "Matrix cross-tabulating item distribution across independent Sales ($) and POS Hits classifications. "
+            "Cells show number of items and their Combined Weighted Score."
+        )
+
+        matrix_long = (
+            score_matrix.reset_index()
+            .melt(id_vars="Sales Class", var_name="Hits Class", value_name="Item Count")
+        )
+
+        matrix_long["Score"] = matrix_long.apply(
+            lambda row: round(0.65 * SCORE_MAP[row["Sales Class"]] + 0.35 * SCORE_MAP[row["Hits Class"]], 2),
+            axis=1,
+        )
+        matrix_long["Result Class"] = matrix_long["Score"].apply(assign_final_class_from_score)
+
+        heat_base = (
+            alt.Chart(matrix_long)
+            .mark_rect(cornerRadius=4)
+            .encode(
+                x=alt.X("Hits Class:N", sort=["A", "B", "C", "D"], title="POS Hits Class (Volume Frequency)"),
+                y=alt.Y("Sales Class:N", sort=["A", "B", "C", "D"], title="Sales ($) Class (Revenue Value)"),
+                color=alt.Color(
+                    "Item Count:Q",
+                    scale=alt.Scale(scheme="blues"),
+                    title="Item Count",
+                ),
+                tooltip=[
+                    alt.Tooltip("Sales Class:N", title="Sales Class"),
+                    alt.Tooltip("Hits Class:N", title="Hits Class"),
+                    alt.Tooltip("Item Count:Q", title="SKU Count"),
+                    alt.Tooltip("Score:Q", title="Weighted Score", format=".2f"),
+                    alt.Tooltip("Result Class:N", title="Final Class"),
+                ],
+            )
+            .properties(height=360)
+        )
+        heat_text = heat_base.mark_text(fontSize=11, fontWeight="bold").encode(
+            text=alt.Text("Item Count:Q", format="d"),
+            color=alt.condition(alt.datum["Item Count"] > 30, alt.value("white"), alt.value("#1E293B")),
+        )
+        st.altair_chart(heat_base + heat_text, use_container_width=True)
+
+    with v_tab3:
+        st.markdown("##### 📈 Cumulative Sales Pareto Curve (Lorenz Curve)")
+        st.caption("Visualizing the Pareto concentration (80/20 rule) of annual revenue across ranked items.")
+
+        sorted_items = classified_df.sort_values(by="Sales ($)", ascending=False).reset_index(drop=True)
+        sorted_items["Rank"] = range(1, len(sorted_items) + 1)
+        sorted_items["Rank Percentage"] = (sorted_items["Rank"] / len(sorted_items)) * 100.0
+
+        pareto_area = (
+            alt.Chart(sorted_items)
+            .mark_area(opacity=0.25, color="#1E3A8A")
+            .encode(
+                x=alt.X("Rank:Q", title="Item Rank (Sorted Descending by Sales)"),
+                y=alt.Y("Cumulative Sales Percentage:Q", title="Cumulative Sales Percentage (%)", scale=alt.Scale(domain=[0, 100])),
+            )
+        )
+        pareto_line = (
+            alt.Chart(sorted_items)
+            .mark_line(strokeWidth=2.5, color="#1E3A8A")
+            .encode(
+                x=alt.X("Rank:Q"),
+                y=alt.Y("Cumulative Sales Percentage:Q"),
+                tooltip=[
+                    alt.Tooltip("Rank:Q", title="Rank"),
+                    alt.Tooltip("Item Name:N", title="Item"),
+                    alt.Tooltip("Sales ($):Q", title="Sales", format="$,.2f"),
+                    alt.Tooltip("Cumulative Sales Percentage:Q", title="Cum Sales %", format=".2f"),
+                    alt.Tooltip("Final Inventory Class:N", title="Final Class"),
+                ],
+            )
+        )
+
+        thresholds = pd.DataFrame([
+            {"Threshold": 60, "Class": "Class A Threshold (60%)", "Color": "#DC2626"},
+            {"Threshold": 80, "Class": "Class B Threshold (80%)", "Color": "#D97706"},
+            {"Threshold": 90, "Class": "Class C Threshold (90%)", "Color": "#0D9488"},
+        ])
+        thresh_lines = (
+            alt.Chart(thresholds)
+            .mark_rule(strokeDash=[6, 4], strokeWidth=1.5)
+            .encode(
+                y=alt.Y("Threshold:Q"),
+                color=alt.Color("Class:N", scale=alt.Scale(
+                    domain=["Class A Threshold (60%)", "Class B Threshold (80%)", "Class C Threshold (90%)"],
+                    range=["#DC2626", "#D97706", "#0D9488"],
+                ), title="Pareto Boundary Lines"),
+            )
+        )
+
+        pareto_chart = (pareto_area + pareto_line + thresh_lines).properties(height=360)
+        st.altair_chart(pareto_chart, use_container_width=True)
+
+    st.markdown("---")
+
+    # 4. Interactive 15-Column Data Table with Search, Filter & CSV Export
+    st.markdown("### 📑 Full Multicriteria Classified Inventory Dataset (15 Required Columns)")
+    st.caption("Complete item-level classification records with intermediate percentages, scores, and final classifications.")
+
+    filter_col, search_col, dl_col = st.columns([1.5, 2.5, 1.5])
+    with filter_col:
+        selected_class = st.selectbox(
+            "Filter by Final Class:",
+            options=["All", "A", "B", "C", "D"],
+            help="Filter items displayed in the interactive table below by their Final Inventory Class.",
+        )
+    with search_col:
+        search_query = st.text_input(
+            "🔍 Search Item Number or Item Name:",
+            value="",
+            placeholder="e.g. 10025 or Drill...",
+        )
+    with dl_col:
+        export_csv_bytes = classified_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="📥 Download Full Dataset (CSV)",
+            data=export_csv_bytes,
+            file_name="multicriteria_inventory_classification.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help="Download the complete 15-column classified inventory dataset as a CSV file.",
+        )
+
+    # Filter data table
+    display_df = classified_df.copy()
+    if selected_class != "All":
+        display_df = display_df[display_df["Final Inventory Class"] == selected_class]
+    if search_query.strip():
+        q_clean = search_query.strip().lower()
+        display_df = display_df[
+            display_df["Item Number"].astype(str).str.lower().str.contains(q_clean)
+            | display_df["Item Name"].astype(str).str.lower().str.contains(q_clean)
+        ]
+
+    st.caption(f"Displaying **{len(display_df):,}** of **{len(classified_df):,}** records.")
+
+    st.dataframe(
+        display_df,
+        column_config={
+            "Item Number": st.column_config.TextColumn("Item Number"),
+            "Item Name": st.column_config.TextColumn("Item Name"),
+            "UoM": st.column_config.TextColumn("UoM"),
+            "Sales ($)": st.column_config.NumberColumn("Sales ($)", format="$%,.2f"),
+            "Hits": st.column_config.NumberColumn("Hits", format="%d"),
+            "Sales Percentage": st.column_config.NumberColumn("Sales %", format="%.2f%%"),
+            "Cumulative Sales Percentage": st.column_config.NumberColumn("Cum Sales %", format="%.2f%%"),
+            "Sales Class": st.column_config.TextColumn("Sales Class"),
+            "Hits Percentage": st.column_config.NumberColumn("Hits %", format="%.2f%%"),
+            "Cumulative Hits Percentage": st.column_config.NumberColumn("Cum Hits %", format="%.2f%%"),
+            "Hits Class": st.column_config.TextColumn("Hits Class"),
+            "Sales Score": st.column_config.NumberColumn("Sales Score", format="%d"),
+            "Hits Score": st.column_config.NumberColumn("Hits Score", format="%d"),
+            "Combined Weighted Score": st.column_config.NumberColumn("Weighted Score", format="%.2f"),
+            "Final Inventory Class": st.column_config.TextColumn("Final Class"),
+        },
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# =====================================================================
 # Main Streamlit Application Entrypoint
 # =====================================================================
 def run_streamlit_app() -> None:
@@ -903,13 +1241,18 @@ def run_streamlit_app() -> None:
 
         # Section 3: Data Upload (At the Bottom)
         st.markdown("### 📁 Data Upload")
-        st.caption("Upload an inventory CSV for immediate batch analysis.")
+        st.caption("Upload an inventory CSV for immediate batch analysis or multicriteria classification.")
         uploaded_csv = st.file_uploader(
             "Upload CSV File",
             type=["csv"],
-            help="File must contain: Product, Category, Units, Unit Cost",
+            help="File must contain either: 1) BAN 517 Multicriteria Dataset (Item Number, Item Name, UoM, Sales ($), Hits) or 2) Standard Inventory Dataset (Product, Category, Units, Unit Cost)",
         )
-        st.caption("Format requirements: `.csv` format containing `Product`, `Category`, `Units`, and `Unit Cost` columns.")
+        load_course_data = st.checkbox(
+            "📂 Load Course Project Dataset (ProjectDataV2_UTF8.csv)",
+            value=False,
+            help="Instantly load the BAN 517 course project dataset (205 items) to inspect multicriteria classification.",
+        )
+        st.caption("Supports BAN 517 multicriteria dataset or general inventory dataset.")
 
     # Populate question box
     default_text = (
@@ -981,105 +1324,145 @@ def run_streamlit_app() -> None:
     # -------------------------------------------------------------
     # Section 6: CSV Data Upload and Analysis Section
     # -------------------------------------------------------------
+    active_csv_file = None
+    data_source_label = ""
     if uploaded_csv is not None:
-        st.divider()
-        st.markdown("## 📊 Uploaded Inventory Data Analysis")
-
-        csv_results = process_and_analyze_inventory_csv(uploaded_csv)
-
-        if not csv_results["valid"]:
-            st.error(
-                f"❌ Missing required column(s): **{', '.join(csv_results['missing_columns'])}**.\n\n"
-                f"Required schema columns: `{'`, `'.join(REQUIRED_COLUMNS)}`."
-            )
-            st.subheader("Uploaded Raw Dataframe Preview")
-            st.dataframe(csv_results["df"], use_container_width=True)
-            st.markdown(f"- **Number of Rows:** {csv_results['num_rows']:,}")
-            st.markdown(f"- **Number of Columns:** {csv_results['num_cols']:,}")
-            st.markdown(f"- **Column Names:** `{', '.join(csv_results['columns'])}`")
+        active_csv_file = uploaded_csv
+        data_source_label = getattr(uploaded_csv, "name", "Uploaded CSV")
+    elif load_course_data:
+        course_file_path = "ProjectDataV2_UTF8.csv"
+        if os.path.exists(course_file_path):
+            with open(course_file_path, "rb") as f:
+                active_csv_file = io.BytesIO(f.read())
+            data_source_label = "ProjectDataV2_UTF8.csv (Course Dataset)"
         else:
-            # Dataset Summary KPI Cards
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Total Records (Rows)", f"{csv_results['num_rows']:,}")
-            k2.metric("Total Units in Stock", f"{csv_results['total_units']:,.0f}")
-            k3.metric("Average Unit Cost", f"${csv_results['avg_unit_cost']:,.2f}")
-            k4.metric("Total Inventory Value", f"${csv_results['total_inventory_value']:,.2f}")
+            st.warning("⚠️ Course dataset 'ProjectDataV2_UTF8.csv' not found in workspace directory.")
 
-            # Top product banner
-            st.info(
-                f"🏆 **Top Stocked Item**: **{csv_results['highest_units_product']}** with "
-                f"**{csv_results['highest_units_count']:,.0f} units**."
-            )
+    if active_csv_file is not None:
+        st.divider()
+        try:
+            if hasattr(active_csv_file, "seek"):
+                active_csv_file.seek(0)
+            df_raw = pd.read_csv(active_csv_file)
+            if hasattr(active_csv_file, "seek"):
+                active_csv_file.seek(0)
 
-            # Charts and Breakdowns
-            c_tab1, c_tab2, c_tab3 = st.tabs([
-                "📊 Category Units Breakdown",
-                "🏆 Top Products by Value",
-                "📋 Full Dataset (with Inventory Value)",
-            ])
+            is_mc, missing_mc, clean_mc_df = validate_classification_dataframe(df_raw)
+            clean_headers = [str(c).strip() for c in df_raw.columns]
+            is_gen = all(col in clean_headers for col in REQUIRED_COLUMNS)
 
-            with c_tab1:
-                cat_df = csv_results["category_units"]
-                st.dataframe(
-                    cat_df,
-                    column_config={"Total Units": st.column_config.NumberColumn(format="%d")},
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                if not cat_df.empty:
-                    bar_chart = (
-                        alt.Chart(cat_df)
-                        .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4, color="#2563EB")
-                        .encode(
-                            x=alt.X("Total Units:Q", title="Total Units"),
-                            y=alt.Y("Category:N", sort="-x", title="Category"),
-                            tooltip=[alt.Tooltip("Category:N"), alt.Tooltip("Total Units:Q", format=",.0f")],
-                        )
-                        .properties(height=260, title="Units Distribution by Category")
+            if is_mc:
+                render_multicriteria_classification_section(clean_mc_df)
+            elif is_gen:
+                st.markdown(f"## 📊 Uploaded Inventory Data Analysis ({data_source_label})")
+                csv_results = process_and_analyze_inventory_csv(active_csv_file)
+
+                if not csv_results["valid"]:
+                    st.error(
+                        f"❌ Missing required column(s): **{', '.join(csv_results['missing_columns'])}**.\n\n"
+                        f"Required schema columns: `{'`, `'.join(REQUIRED_COLUMNS)}`."
                     )
-                    st.altair_chart(bar_chart, use_container_width=True)
+                    st.subheader("Uploaded Raw Dataframe Preview")
+                    st.dataframe(csv_results["df"], use_container_width=True)
+                    st.markdown(f"- **Number of Rows:** {csv_results['num_rows']:,}")
+                    st.markdown(f"- **Number of Columns:** {csv_results['num_cols']:,}")
+                    st.markdown(f"- **Column Names:** `{', '.join(csv_results['columns'])}`")
+                else:
+                    # Dataset Summary KPI Cards
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("Total Records (Rows)", f"{csv_results['num_rows']:,}")
+                    k2.metric("Total Units in Stock", f"{csv_results['total_units']:,.0f}")
+                    k3.metric("Average Unit Cost", f"${csv_results['avg_unit_cost']:,.2f}")
+                    k4.metric("Total Inventory Value", f"${csv_results['total_inventory_value']:,.2f}")
 
-            with c_tab2:
-                clean_df = csv_results["df"]
-                top10 = clean_df.sort_values(by="Inventory Value", ascending=False).head(10)
-                st.dataframe(
-                    top10[["Product", "Category", "Units", "Unit Cost", "Inventory Value"]],
-                    column_config={
-                        "Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
-                        "Inventory Value": st.column_config.NumberColumn(format="$%.2f"),
-                        "Units": st.column_config.NumberColumn(format="%d"),
-                    },
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                if not top10.empty:
-                    val_chart = (
-                        alt.Chart(top10)
-                        .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4, color="#0D9488")
-                        .encode(
-                            x=alt.X("Inventory Value:Q", title="Total Inventory Value ($)"),
-                            y=alt.Y("Product:N", sort="-x", title="Product"),
-                            tooltip=[
-                                alt.Tooltip("Product:N"),
-                                alt.Tooltip("Units:Q", format=",.0f"),
-                                alt.Tooltip("Unit Cost:Q", format="$,.2f"),
-                                alt.Tooltip("Inventory Value:Q", format="$,.2f"),
-                            ],
-                        )
-                        .properties(height=280, title="Top 10 Products by Inventory Valuation ($)")
+                    # Top product banner
+                    st.info(
+                        f"🏆 **Top Stocked Item**: **{csv_results['highest_units_product']}** with "
+                        f"**{csv_results['highest_units_count']:,.0f} units**."
                     )
-                    st.altair_chart(val_chart, use_container_width=True)
 
-            with c_tab3:
-                st.dataframe(
-                    csv_results["df"],
-                    column_config={
-                        "Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
-                        "Inventory Value": st.column_config.NumberColumn(format="$%.2f"),
-                        "Units": st.column_config.NumberColumn(format="%d"),
-                    },
-                    use_container_width=True,
+                    # Charts and Breakdowns
+                    c_tab1, c_tab2, c_tab3 = st.tabs([
+                        "📊 Category Units Breakdown",
+                        "🏆 Top Products by Value",
+                        "📋 Full Dataset (with Inventory Value)",
+                    ])
+
+                    with c_tab1:
+                        cat_df = csv_results["category_units"]
+                        st.dataframe(
+                            cat_df,
+                            column_config={"Total Units": st.column_config.NumberColumn(format="%d")},
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                        if not cat_df.empty:
+                            bar_chart = (
+                                alt.Chart(cat_df)
+                                .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4, color="#2563EB")
+                                .encode(
+                                    x=alt.X("Total Units:Q", title="Total Units"),
+                                    y=alt.Y("Category:N", sort="-x", title="Category"),
+                                    tooltip=[alt.Tooltip("Category:N"), alt.Tooltip("Total Units:Q", format=",.0f")],
+                                )
+                                .properties(height=260, title="Units Distribution by Category")
+                            )
+                            st.altair_chart(bar_chart, use_container_width=True)
+
+                    with c_tab2:
+                        clean_df = csv_results["df"]
+                        top10 = clean_df.sort_values(by="Inventory Value", ascending=False).head(10)
+                        st.dataframe(
+                            top10[["Product", "Category", "Units", "Unit Cost", "Inventory Value"]],
+                            column_config={
+                                "Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
+                                "Inventory Value": st.column_config.NumberColumn(format="$%.2f"),
+                                "Units": st.column_config.NumberColumn(format="%d"),
+                            },
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                        if not top10.empty:
+                            val_chart = (
+                                alt.Chart(top10)
+                                .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4, color="#0D9488")
+                                .encode(
+                                    x=alt.X("Inventory Value:Q", title="Total Inventory Value ($)"),
+                                    y=alt.Y("Product:N", sort="-x", title="Product"),
+                                    tooltip=[
+                                        alt.Tooltip("Product:N"),
+                                        alt.Tooltip("Units:Q", format=",.0f"),
+                                        alt.Tooltip("Unit Cost:Q", format="$,.2f"),
+                                        alt.Tooltip("Inventory Value:Q", format="$,.2f"),
+                                    ],
+                                )
+                                .properties(height=280, title="Top 10 Products by Inventory Valuation ($)")
+                            )
+                            st.altair_chart(val_chart, use_container_width=True)
+
+                    with c_tab3:
+                        st.dataframe(
+                            csv_results["df"],
+                            column_config={
+                                "Unit Cost": st.column_config.NumberColumn(format="$%.2f"),
+                                "Inventory Value": st.column_config.NumberColumn(format="$%.2f"),
+                                "Units": st.column_config.NumberColumn(format="%d"),
+                            },
+                            use_container_width=True,
+                        )
+            else:
+                st.error(
+                    f"❌ Uploaded dataset does not match any recognized schema.\n\n"
+                    f"- For **Multicriteria Inventory Classification (BAN 517)**, missing columns: `{', '.join(missing_mc)}`\n"
+                    f"- For **General Inventory Analysis**, missing columns: `{[c for c in REQUIRED_COLUMNS if c not in clean_headers]}`"
                 )
+                st.subheader("Uploaded Raw Dataframe Preview")
+                st.dataframe(df_raw, use_container_width=True)
+                st.markdown(f"- **Number of Rows:** {len(df_raw):,}")
+                st.markdown(f"- **Number of Columns:** {len(df_raw.columns):,}")
+                st.markdown(f"- **Column Names:** `{', '.join(df_raw.columns)}`")
+        except Exception as exc:
+            st.error(f"❌ Error processing uploaded CSV file: {exc}")
 
 
 # =====================================================================

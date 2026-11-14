@@ -105,9 +105,16 @@ def calculate_eoq(
     unit_cost: Optional[float] = None,
     holding_rate: Optional[float] = None,
     working_days: Optional[float] = None,
+    stated_demand: Optional[float] = None,
+    demand_period: Optional[str] = None,
+    demand_conversion_factor: Optional[float] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Calculate Economic Order Quantity: Q* = sqrt(2 * D * S / H).
+
+    Supports demand time unit normalization:
+    - If demand was stated non-annually (e.g. monthly, weekly, daily), it is normalized to an annual basis.
 
     Returns 8 verification elements:
     1. inputs_extracted
@@ -179,8 +186,16 @@ def calculate_eoq(
     )
     cycle_time_days = (w_days / orders_per_year) if w_days is not None else None
 
+    # Determine if demand was normalized from a non-annual period
+    is_demand_normalized = (
+        stated_demand is not None
+        and demand_period is not None
+        and demand_period.lower().strip() not in ("year", "annual", "annually", "annum")
+    )
+    mult = demand_conversion_factor if demand_conversion_factor else (d_val / stated_demand if stated_demand and stated_demand > 0 else 1.0)
+
     # 1. Inputs Extracted
-    inputs_extracted = {
+    inputs_extracted: Dict[str, Any] = {
         "annual_demand": d_val,
         "ordering_cost": s_val,
         "holding_cost": round(h_val, 4),
@@ -188,10 +203,19 @@ def calculate_eoq(
         "holding_rate": rate_val,
         "working_days": w_days,
     }
+    if is_demand_normalized:
+        inputs_extracted["stated_demand"] = stated_demand
+        inputs_extracted["demand_period"] = demand_period
+        inputs_extracted["demand_conversion_factor"] = mult
 
     # 2. Variable Definitions
+    d_def = (
+        f"Annual demand (units/year) [Normalized from {stated_demand:,.2f} units/{demand_period} to {d_val:,.2f} units/year]"
+        if is_demand_normalized
+        else "Annual demand (units/year)"
+    )
     variable_definitions = {
-        "D": "Annual demand (units/year)",
+        "D": d_def,
         "S": "Ordering / setup cost per order ($/order)",
         "H": "Holding (carrying) cost per unit per year ($/unit/year)",
         "C": "Unit purchase price / cost ($/unit)",
@@ -206,7 +230,7 @@ def calculate_eoq(
     }
 
     # 3. Formula
-    formula = {
+    formula: Dict[str, str] = {
         "eoq": "Q* = sqrt((2 * D * S) / H)",
         "orders_per_year": "N = D / Q*",
         "cycle_time_days": "T_cycle = working_days / (D / Q*)",
@@ -215,9 +239,11 @@ def calculate_eoq(
         "total_relevant_cost": "TRC = (D / Q*) * S + (Q* / 2) * H",
         "total_annual_cost": "TC = TRC + (D * C)",
     }
+    if is_demand_normalized:
+        formula["demand_normalization"] = f"D = stated_demand * conversion_factor ({demand_period}s/year)"
 
     # 4. Formula with Substituted Values
-    formula_with_substituted_values = {
+    formula_with_substituted_values: Dict[str, str] = {
         "eoq": f"Q* = sqrt((2 * {d_val:,.2f} * {s_val:,.2f}) / {h_val:,.4f}) = sqrt({numerator:,.2f} / {h_val:,.4f}) = {eoq:,.4f} units",
         "orders_per_year": f"N = {d_val:,.2f} / {eoq:,.4f} = {orders_per_year:,.4f} orders/year",
         "cycle_time_days": f"T_cycle = {w_days:,.0f} / {orders_per_year:,.4f} = {cycle_time_days:,.2f} days" if w_days else "T_cycle = working_days / N (working days not specified)",
@@ -226,9 +252,13 @@ def calculate_eoq(
         "total_relevant_cost": f"TRC = ${annual_ordering_cost:,.2f} + ${annual_holding_cost:,.2f} = ${total_relevant_cost:,.2f}",
         "total_annual_cost": f"TC = ${total_relevant_cost:,.2f} + ({d_val:,.2f} * ${c_val:,.2f}) = ${total_relevant_cost:,.2f} + ${annual_purchase_cost:,.2f} = ${total_annual_cost:,.2f}" if c_val else f"TC = TRC = ${total_relevant_cost:,.2f} (unit purchase cost not specified)",
     }
+    if is_demand_normalized:
+        formula_with_substituted_values["demand_normalization"] = (
+            f"D = {stated_demand:,.2f} units/{demand_period} * {mult:g} {demand_period}s/year = {d_val:,.2f} units/year"
+        )
 
     # 5. Intermediate Calculations
-    intermediate_calculations = {
+    intermediate_calculations: Dict[str, Any] = {
         "two_D_S": round(numerator, 4),
         "holding_cost_per_unit": round(h_val, 4),
         "holding_cost_derivation": holding_cost_source,
@@ -242,6 +272,15 @@ def calculate_eoq(
         "annual_purchase_cost": round(annual_purchase_cost, 4) if annual_purchase_cost is not None else None,
         "total_annual_cost": round(total_annual_cost, 4),
     }
+    if is_demand_normalized:
+        intermediate_calculations["stated_demand"] = stated_demand
+        intermediate_calculations["demand_period"] = demand_period
+        intermediate_calculations["demand_conversion_factor"] = mult
+        intermediate_calculations["demand_normalization_note"] = (
+            f"Demand was stated as {stated_demand:,.2f} units per {demand_period} and normalized to "
+            f"{d_val:,.2f} units per year ({stated_demand:,.2f} * {mult:g} {demand_period}s/year) "
+            "to ensure dimensional consistency with annual holding cost (H)."
+        )
 
     # 6. Final Answer
     final_answer = {
@@ -263,6 +302,12 @@ def calculate_eoq(
         "Stockouts, backorders, and shortages are not permitted.",
         "No quantity discounts apply (unit purchase cost C is constant).",
     ]
+    if is_demand_normalized:
+        assumptions.insert(
+            1,
+            f"Demand was stated on a {demand_period}ly basis ({stated_demand:,.2f} units/{demand_period}) "
+            f"and converted to {d_val:,.2f} units/year ({stated_demand:,.2f} × {mult:g}) to match the annual holding cost period.",
+        )
 
     results: Dict[str, Any] = {
         "model": "eoq",
@@ -303,6 +348,10 @@ def calculate_quantity_discount(
     tiers: Optional[List[Dict[str, Any]]] = None,
     holding_rate: Optional[float] = None,
     holding_cost: Optional[float] = None,
+    stated_demand: Optional[float] = None,
+    demand_period: Optional[str] = None,
+    demand_conversion_factor: Optional[float] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Evaluate feasible order quantities across price-break tiers and compare total annual cost.
@@ -564,6 +613,12 @@ def calculate_rop(
     service_level: Optional[float] = None,
     z_score: Optional[float] = None,
     safety_stock: Optional[float] = None,
+    stated_lead_time: Optional[float] = None,
+    lead_time_unit: Optional[str] = None,
+    stated_std_lead_time: Optional[float] = None,
+    demand_unit: Optional[str] = None,
+    days_per_week: Optional[float] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Calculate Safety Stock (SS) and Reorder Point (ROP).
@@ -595,6 +650,21 @@ def calculate_rop(
             "Missing variability inputs: provide std_demand (sigma_d) and/or std_lead_time (sigma_L), "
             "or provide safety_stock directly. Pass 0 for constant demand and/or constant lead time."
         )
+
+    # Unit conversion / normalization metadata handling
+    lead_time_converted = False
+    op_days = days_per_week if days_per_week is not None else 7.0
+    raw_lead_time = stated_lead_time if stated_lead_time is not None else lead_time
+    raw_std_lead_time = stated_std_lead_time if stated_std_lead_time is not None else std_lead_time
+
+    lt_unit_norm = (lead_time_unit or "").strip().lower()
+    d_unit_norm = (demand_unit or "").strip().lower()
+    if lt_unit_norm in ("week", "weeks") and (d_unit_norm in ("day", "days") or not d_unit_norm):
+        lead_time_converted = True
+        if lead_time is not None and (stated_lead_time is None or lead_time == stated_lead_time):
+            lead_time = lead_time * op_days
+        if std_lead_time is not None and (stated_std_lead_time is None or std_lead_time == stated_std_lead_time):
+            std_lead_time = std_lead_time * op_days
 
     d_val = _validate_numeric("avg_demand", avg_demand)
     l_val = _validate_numeric("lead_time", lead_time)
@@ -658,6 +728,31 @@ def calculate_rop(
     expected_lt_demand = d_val * l_val
     reorder_point = expected_lt_demand + calc_ss
 
+    # Alternative 5-day work week calculation when converted from weeks
+    alt_5day = None
+    if lead_time_converted and raw_lead_time is not None:
+        raw_lt_val = float(raw_lead_time)
+        raw_std_lt_val = float(raw_std_lead_time) if raw_std_lead_time is not None else 0.0
+        alt_l = raw_lt_val * 5.0
+        alt_std_l = raw_std_lt_val * 5.0
+        alt_exp_lt = d_val * alt_l
+        alt_var_d = alt_l * (sigma_d ** 2)
+        alt_var_l = (d_val ** 2) * (alt_std_l ** 2)
+        alt_sigma_lt = math.sqrt(alt_var_d + alt_var_l)
+        alt_ss = z * alt_sigma_lt
+        alt_rop = alt_exp_lt + alt_ss
+        alt_5day = {
+            "days_per_week": 5.0,
+            "lead_time_days": round(alt_l, 4),
+            "std_lead_time_days": round(alt_std_l, 4),
+            "expected_demand_during_lead_time": round(alt_exp_lt, 4),
+            "sigma_lt": round(alt_sigma_lt, 4),
+            "safety_stock": round(alt_ss, 4),
+            "safety_stock_rounded": round(alt_ss),
+            "reorder_point": round(alt_rop, 4),
+            "reorder_point_rounded": round(alt_rop),
+        }
+
     # 1. Inputs Extracted
     inputs_extracted = {
         "avg_demand": d_val,
@@ -668,6 +763,16 @@ def calculate_rop(
         "z_score": round(z, 6),
         "safety_stock": round(calc_ss, 4) if safety_stock is not None else None,
     }
+    if lead_time_converted or raw_lead_time is not None:
+        if raw_lead_time is not None:
+            inputs_extracted["stated_lead_time"] = raw_lead_time
+        if lead_time_unit:
+            inputs_extracted["lead_time_unit"] = lead_time_unit
+        if raw_std_lead_time is not None:
+            inputs_extracted["stated_std_lead_time"] = raw_std_lead_time
+        if demand_unit:
+            inputs_extracted["demand_unit"] = demand_unit
+        inputs_extracted["days_per_week_assumed"] = op_days
 
     # 2. Variable Definitions
     variable_definitions = {
@@ -712,14 +817,20 @@ def calculate_rop(
         "safety_stock": round(calc_ss, 4),
         "reorder_point": round(reorder_point, 4),
     }
+    if alt_5day:
+        intermediate_calculations["alternative_5day_work_week"] = alt_5day
 
     # 6. Final Answer
+    rec_text = f"Maintain a safety stock of {calc_ss:,.2f} units (approx. {round(calc_ss):,} units). Trigger a replenishment order whenever inventory position drops to the Reorder Point of {reorder_point:,.2f} units (approx. {round(reorder_point):,} units) to satisfy a {csl * 100:.1f}% cycle service level."
+    if alt_5day:
+        rec_text += f" (Note: Based on standard 7 calendar days/week; if using a 5-day work week, Safety Stock is {alt_5day['safety_stock']:,.2f} units and ROP is {alt_5day['reorder_point']:,.2f} units)."
+
     final_answer = {
         "safety_stock": round(calc_ss, 4),
         "safety_stock_rounded": round(calc_ss),
         "reorder_point": round(reorder_point, 4),
         "reorder_point_rounded": round(reorder_point),
-        "recommendation": f"Maintain a safety stock of {calc_ss:,.2f} units (approx. {round(calc_ss):,} units). Trigger a replenishment order whenever inventory position drops to the Reorder Point of {reorder_point:,.2f} units (approx. {round(reorder_point):,} units) to satisfy a {csl * 100:.1f}% cycle service level.",
+        "recommendation": rec_text,
     }
 
     # 8. Assumptions
@@ -728,8 +839,16 @@ def calculate_rop(
         "Continuous review policy: inventory position is monitored continuously and an order is placed as soon as inventory position <= ROP.",
         "Demand per period and lead time are independent random variables.",
         "Lead-time demand follows a normal distribution (when variable).",
-        "Time units for average demand, standard deviation of demand, and lead time are identical and consistent.",
+        "Time units for average demand, standard deviation of demand, and lead time are consistent and expressed on the same time basis.",
     ]
+    if lead_time_converted and raw_lead_time is not None:
+        assumptions.append(
+            f"Lead-time normalization: Lead time was stated as {raw_lead_time:g} {lead_time_unit or 'weeks'} with standard deviation {raw_std_lead_time or 0.0:g} {lead_time_unit or 'weeks'}. Converted to daily basis using standard {op_days:g} calendar days/week (L = {l_val:g} days, sigma_L = {sigma_l:g} days)."
+        )
+        if alt_5day:
+            assumptions.append(
+                f"Alternative 5-day work week: If operations/replenishment follow a 5-day business week (L = {alt_5day['lead_time_days']:g} days, sigma_L = {alt_5day['std_lead_time_days']:g} days), Expected LTD = {alt_5day['expected_demand_during_lead_time']:,.2f} units, sigma_LT = {alt_5day['sigma_lt']:,.2f} units, Safety Stock = {alt_5day['safety_stock']:,.2f} units (approx. {alt_5day['safety_stock_rounded']:,} units), and Reorder Point = {alt_5day['reorder_point']:,.2f} units (approx. {alt_5day['reorder_point_rounded']:,} units)."
+            )
 
     results = {
         "model": "safety_stock_rop",
@@ -781,6 +900,7 @@ def calculate_periodic_review(
     on_hand_inventory: Optional[float] = None,
     on_order_inventory: Optional[float] = None,
     backorders: Optional[float] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Calculate Target Inventory and Order Quantity for a Fixed-Period (Periodic) Review System.
@@ -1019,6 +1139,7 @@ def calculate_newsvendor(
     distribution: str = "normal",
     min_demand: Optional[float] = None,
     max_demand: Optional[float] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Calculate underage cost (Cu), overage cost (Co), critical ratio (CR),
